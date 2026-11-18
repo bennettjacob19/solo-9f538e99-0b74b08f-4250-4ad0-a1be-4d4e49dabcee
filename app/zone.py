@@ -1,5 +1,14 @@
 """Zone text parsing, whole-version validation, immutable snapshots, and
-single-version resolution for the svc.test. authoritative zone."""
+single-version resolution for the svc.test. authoritative zone.
+
+Subdomain delegation model: a name holding an NS record is a delegation
+point (zone cut). Exactly one NS record is allowed there, its target must
+lie strictly inside the delegated subdomain and must carry glue A record(s)
+in the same version. The delegation point itself may not hold A/CNAME, and
+nothing below the cut may exist except the glue A records. Queries at or
+below a cut get a non-authoritative referral (NS in Authority, glue only in
+Additional); a CNAME chain that runs into a cut stops at the CNAME — glue
+is never served as a business A answer."""
 
 import ipaddress
 import re
@@ -53,12 +62,16 @@ def _check_name(name):
             raise ValueError(f"bad label '{label}' in {name}")
 
 
+def _new_rec(ttl):
+    return {"A": [], "CNAME": None, "NS": [], "ttl": ttl}
+
+
 def parse_zone_text(text):
     """Parse and validate a full zone version.
 
-    Line format:  <name> <A|CNAME> <value> [ttl]     (# starts a comment)
+    Line format:  <name> <A|CNAME|NS> <value> [ttl]   (# starts a comment)
 
-    Returns {name: {"A": [ip, ...], "CNAME": target|None, "ttl": int}}.
+    Returns {name: {"A": [...], "CNAME": target|None, "NS": [...], "ttl": int}}.
     Raises ZoneError listing every problem found; nothing is half-accepted.
     """
     records = {}
@@ -70,7 +83,7 @@ def parse_zone_text(text):
             continue
         parts = line.split()
         if len(parts) < 3:
-            errors.append(f"line {lineno}: expected '<name> <A|CNAME> <value> [ttl]'")
+            errors.append(f"line {lineno}: expected '<name> <A|CNAME|NS> <value> [ttl]'")
             continue
         if len(parts) > 4:
             errors.append(f"line {lineno}: too many fields")
@@ -90,7 +103,7 @@ def parse_zone_text(text):
         except ValueError as exc:
             errors.append(f"line {lineno}: {exc}")
             continue
-        rec = records.setdefault(name, {"A": [], "CNAME": None, "ttl": ttl})
+        rec = records.setdefault(name, _new_rec(ttl))
 
         if rtype == "A":
             try:
@@ -112,8 +125,20 @@ def parse_zone_text(text):
                 errors.append(f"line {lineno}: duplicate CNAME for {name}")
                 continue
             rec["CNAME"] = target
+        elif rtype == "NS":
+            try:
+                target = fqdn(value)
+            except ValueError:
+                errors.append(
+                    f"line {lineno}: NS target '{value}' is not a name inside {ZONE}"
+                )
+                continue
+            if target not in rec["NS"]:
+                rec["NS"].append(target)
         else:
-            errors.append(f"line {lineno}: unsupported record type '{parts[1]}' (A/CNAME only)")
+            errors.append(
+                f"line {lineno}: unsupported record type '{parts[1]}' (A/CNAME/NS only)"
+            )
 
     errors.extend(validate_records(records))
     if errors:
@@ -121,11 +146,21 @@ def parse_zone_text(text):
     return records
 
 
+def _is_below(name, ancestor):
+    """True if name is strictly below ancestor (a proper subname)."""
+    return name.endswith("." + ancestor)
+
+
 def validate_records(records):
     """Cross-record rules for one candidate version.
 
     - a name cannot hold both A and CNAME
-    - every CNAME target must exist in this same version (no dangling)
+    - delegation: a name with NS is a zone cut. It must hold exactly one NS
+      record whose target lies strictly inside the delegated subdomain and
+      has glue A record(s) in this same version; the cut name itself may not
+      hold A/CNAME; below the cut only the glue name's A records may exist
+    - every CNAME target must exist in this same version (no dangling);
+      a CNAME may point at a glue name, but never at a delegation point
     - CNAME chains must be acyclic and terminate at a name with A record(s)
     """
     errors = []
@@ -134,10 +169,53 @@ def validate_records(records):
         if rec["A"] and rec["CNAME"]:
             errors.append(f"{name}: cannot have both A and CNAME records")
 
+    delegations = sorted(n for n, r in records.items() if r["NS"])
+    for cut in delegations:
+        rec = records[cut]
+        if cut == ZONE:
+            errors.append(f"{ZONE}: NS at the zone apex is not supported")
+            continue
+        if rec["A"] or rec["CNAME"]:
+            errors.append(f"{cut}: delegation point cannot also hold A/CNAME records")
+        if len(rec["NS"]) != 1:
+            errors.append(
+                f"{cut}: delegation must point to exactly one in-subdomain "
+                f"name server (got {len(rec['NS'])} NS records)"
+            )
+        for target in rec["NS"]:
+            if not _is_below(target, cut):
+                errors.append(
+                    f"{cut}: NS target {target} is not inside the delegated subdomain"
+                )
+                continue
+            glue = records.get(target)
+            if glue is None or not glue["A"]:
+                errors.append(
+                    f"{cut}: NS target {target} has no glue A record in this version"
+                )
+        # below the cut, only the glue name's A records may exist
+        glue_names = set(rec["NS"])
+        for name in sorted(records):
+            if name == cut or not _is_below(name, cut):
+                continue
+            other = records[name]
+            if name not in glue_names:
+                errors.append(
+                    f"{name}: only glue A records for the NS target may exist "
+                    f"below delegation {cut}"
+                )
+            elif other["CNAME"] or other["NS"]:
+                errors.append(f"{name}: glue name may only hold A records")
+
+    def below_some_cut(name):
+        return any(name == cut or _is_below(name, cut) for cut in delegations)
+
     for name in sorted(records):
         rec = records[name]
         if not rec["CNAME"]:
             continue
+        if below_some_cut(name):
+            continue  # already rejected by the delegation rules above
         seen = {name}
         node = rec["CNAME"]
         while True:
@@ -151,12 +229,20 @@ def validate_records(records):
                 errors.append(f"{name}: CNAME chain loops back to {node} (cycle)")
                 break
             seen.add(node)
+            if target["NS"]:
+                errors.append(
+                    f"{name}: CNAME target {node} is a delegation point; "
+                    "chains must end at A records"
+                )
+                break
             if target["CNAME"]:
                 node = target["CNAME"]
                 continue
             if target["A"]:
-                break  # chain ends at address records: OK
-            break  # pragma: no cover - a stored record always has A or CNAME
+                break  # chain ends at address records: OK (a glue name is
+                # allowed; the resolver stops at the cut and never serves
+                # glue as a business A answer)
+            break  # pragma: no cover - a stored record always has A/CNAME/NS
     return errors
 
 
@@ -169,22 +255,30 @@ def flatten_records(records):
             rows.append((name, "A", ip, rec["ttl"]))
         if rec["CNAME"]:
             rows.append((name, "CNAME", rec["CNAME"], rec["ttl"]))
+        for ns in rec["NS"]:
+            rows.append((name, "NS", ns, rec["ttl"]))
     return rows
 
 
 class Snapshot:
     """Immutable view of one published version. A query resolves its whole
     alias chain against the single Snapshot instance captured at query start,
-    so the chain and the final A address always come from the same version."""
+    so the chain, the final A address, and any referral (NS + glue) always
+    come from the same committed version."""
 
     __slots__ = ("version_id", "created_at", "records")
 
     def __init__(self, version_id, created_at, records):
         self.version_id = version_id
         self.created_at = created_at
-        # freeze: A lists become tuples, structure is never mutated afterwards
+        # freeze: lists become tuples, structure is never mutated afterwards
         self.records = {
-            name: {"A": tuple(rec["A"]), "CNAME": rec["CNAME"], "ttl": rec["ttl"]}
+            name: {
+                "A": tuple(rec["A"]),
+                "CNAME": rec["CNAME"],
+                "NS": tuple(rec["NS"]),
+                "ttl": rec["ttl"],
+            }
             for name, rec in records.items()
         }
 
@@ -196,18 +290,25 @@ class Snapshot:
                 lines.append(f"{name} A {ip} {rec['ttl']}")
             if rec["CNAME"]:
                 lines.append(f"{name} CNAME {rec['CNAME']} {rec['ttl']}")
+            for ns in rec["NS"]:
+                lines.append(f"{name} NS {ns} {rec['ttl']}")
         return "\n".join(lines)
 
 
 def snapshot_from_rows(version_id, created_at, rows):
-    """Rebuild a Snapshot from stored rows (name, rtype, value, ttl)."""
+    """Rebuild a Snapshot from stored rows (name, rtype, value, ttl).
+
+    Rows of type A/CNAME written by older versions load unchanged; NS rows
+    appear only in versions written after delegation support."""
     records = {}
     for name, rtype, value, ttl in rows:
-        rec = records.setdefault(name, {"A": [], "CNAME": None, "ttl": ttl})
+        rec = records.setdefault(name, _new_rec(ttl))
         if rtype == "A":
             rec["A"].append(value)
-        else:
+        elif rtype == "CNAME":
             rec["CNAME"] = value
+        else:  # NS
+            rec["NS"].append(value)
     return Snapshot(version_id, created_at, records)
 
 
@@ -231,15 +332,45 @@ class SnapshotHolder:
             self._snap = snap
 
 
+def _find_cut(snapshot, qname):
+    """Deepest delegation point (name with NS records) at or above qname,
+    strictly below the zone apex. Returns (cut_name, record) or (None, None).
+    Callers must have already confirmed qname is inside the zone."""
+    node = qname
+    while node != ZONE:
+        rec = snapshot.records.get(node)
+        if rec is not None and rec["NS"]:
+            return node, rec
+        node = node.split(".", 1)[1]
+    return None, None
+
+
 def resolve(snapshot, qname, qtype):
     """Resolve qname/qtype against one snapshot.
 
-    Returns (rcode, answers) where answers is a list of
-    (name, rtype, value, ttl). qtype is a mnemonic: A, CNAME, ANY, ...
+    Returns (rcode, aa, answers, authority, additional) where each section
+    is a list of (name, rtype, value, ttl). qtype is a mnemonic: A, CNAME,
+    NS, ANY, ...
+
+    A qname at or below a delegation point gets a non-authoritative
+    referral: aa=0, empty answer, the NS record in authority, and only the
+    corresponding glue A records in additional — all taken from this one
+    snapshot. A CNAME chain that reaches a cut stops at the CNAME: glue is
+    authoritative data for the child side, never a business A answer here.
     """
     qname = qname.lower()
     if qname != ZONE and not qname.endswith("." + ZONE):
-        return "REFUSED", []
+        return "REFUSED", 0, [], [], []
+
+    cut_name, cut_rec = _find_cut(snapshot, qname)
+    if cut_name is not None:
+        authority = [(cut_name, "NS", ns, cut_rec["ttl"]) for ns in cut_rec["NS"]]
+        additional = []
+        for ns in cut_rec["NS"]:
+            glue = snapshot.records.get(ns)
+            if glue:  # a validated version always has the glue; be safe
+                additional.extend((ns, "A", ip, glue["ttl"]) for ip in glue["A"])
+        return "NOERROR", 0, [], authority, additional
 
     answers = []
     node = qname
@@ -249,21 +380,25 @@ def resolve(snapshot, qname, qtype):
         if rec is None:
             if answers:
                 # A validated version never dangles; degrade gracefully.
-                return "NOERROR", answers
+                return "NOERROR", 1, answers, [], []
             if node == ZONE:
-                return "NOERROR", []  # zone apex exists but holds no such data
-            return "NXDOMAIN", []
+                return "NOERROR", 1, [], [], []  # apex exists but holds no such data
+            return "NXDOMAIN", 1, [], [], []
         if rec["CNAME"]:
             if node in seen:  # corrupt data safeguard; validated zones never loop
-                return "NOERROR", answers
+                return "NOERROR", 1, answers, [], []
             seen.add(node)
             answers.append((node, "CNAME", rec["CNAME"], rec["ttl"]))
             if qtype == "CNAME":
-                return "NOERROR", answers
+                return "NOERROR", 1, answers, [], []
             node = rec["CNAME"]
+            if _find_cut(snapshot, node)[0] is not None:
+                # The chain runs into delegated space: stop at the CNAME.
+                # Glue must not be served as the business A answer.
+                return "NOERROR", 1, answers, [], []
             continue
         if rec["A"]:
             if qtype in ("A", "ANY"):
                 answers.extend((node, "A", ip, rec["ttl"]) for ip in rec["A"])
-            return "NOERROR", answers
-        return "NOERROR", answers  # pragma: no cover
+            return "NOERROR", 1, answers, [], []
+        return "NOERROR", 1, answers, [], []  # pragma: no cover

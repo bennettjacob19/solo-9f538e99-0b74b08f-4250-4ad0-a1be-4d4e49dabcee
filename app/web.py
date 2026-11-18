@@ -69,6 +69,10 @@ def records_table(snap):
             rows.append(
                 f"<tr><td>{esc(name)}</td><td>CNAME</td><td>{esc(rec['CNAME'])}</td><td>{rec['ttl']}</td></tr>"
             )
+        for ns in rec["NS"]:
+            rows.append(
+                f"<tr><td>{esc(name)}</td><td>NS</td><td>{esc(ns)}</td><td>{rec['ttl']}</td></tr>"
+            )
     body = "".join(rows) or "<tr><td colspan=4 class='muted'>(空区域)</td></tr>"
     return ("<table><tr><th>名称</th><th>类型</th><th>值</th><th>TTL</th></tr>" + body + "</table>")
 
@@ -99,15 +103,18 @@ def index_body(msg="", err=""):
 <form method="get" action="/query">
   <input type="text" name="name" placeholder="web 或 web.svc.test." required>
   <select name="qtype">
-    <option>A</option><option>CNAME</option><option>ANY</option>
+    <option>A</option><option>CNAME</option><option>NS</option><option>ANY</option>
   </select>
   <button type="submit">查询</button>
 </form>
 
 <h2>发布新版（整版提交，校验/写入任一失败则整版拒绝）</h2>
 <form method="post" action="/publish">
-  <p class="muted">每行一条：<code>名称 A|CNAME 值 [TTL]</code>，# 为注释。
-  CNAME 只能指向本区域内已定义的名称，循环或悬空将整版拒绝。</p>
+  <p class="muted">每行一条：<code>名称 A|CNAME|NS 值 [TTL]</code>，# 为注释。
+  CNAME 只能指向本区域内已定义的名称，循环或悬空将整版拒绝。<br>
+  子域委派示例：<code>dev.svc.test. NS ns.dev.svc.test.</code> 加
+  <code>ns.dev.svc.test. A 10.0.0.53</code>（胶水）。NS 只能指向子域内一个有胶水的名称；
+  委派点不得再有 A/CNAME，子域内除胶水外不得有其他记录，否则整版拒绝。</p>
   <textarea name="zone_text" rows="12">{esc(prefill)}</textarea>
   <p><input type="text" name="note" placeholder="备注（可选）"></p>
   <button type="submit">校验并发布</button>
@@ -153,8 +160,8 @@ def publish(zone_text: str = Form(...), note: str = Form("")):
 @app.get("/query", response_class=HTMLResponse)
 def query(name: str = "", qtype: str = "A"):
     qtype = qtype.upper()
-    if qtype not in ("A", "CNAME", "ANY"):
-        return page("<div class='err'>仅支持 A / CNAME / ANY 查询</div><p><a href='/'>返回</a></p>",
+    if qtype not in ("A", "CNAME", "NS", "ANY"):
+        return page("<div class='err'>仅支持 A / CNAME / NS / ANY 查询</div><p><a href='/'>返回</a></p>",
                     status_code=400)
     try:
         qname = fqdn(name)
@@ -171,10 +178,13 @@ def query(name: str = "", qtype: str = "A"):
 
     rcode = dnslib.RCODE[resp.header.rcode]
     lines = [f";; ->>HEADER<<- rcode: {rcode}, aa: {resp.header.aa}"]
-    for rr in resp.rr:
-        lines.append(f"{rr.rname} {rr.ttl} IN {dnslib.QTYPE[rr.rtype]} {rr.rdata}")
-    if not resp.rr:
-        lines.append(";; (no answer records)")
+    for title, rrs in (("ANSWER", resp.rr), ("AUTHORITY", resp.auth), ("ADDITIONAL", resp.ar)):
+        lines.append(f";; {title} SECTION:")
+        if rrs:
+            for rr in rrs:
+                lines.append(f"{rr.rname} {rr.ttl} IN {dnslib.QTYPE[rr.rtype]} {rr.rdata}")
+        else:
+            lines.append(";; (empty)")
     body = (f"<h2>查询 {esc(qname)} {qtype}</h2><pre>{esc(chr(10).join(lines))}</pre>"
             "<p><a href='/'>返回</a></p>")
     return page(body, title=f"query {qname}")
@@ -192,6 +202,8 @@ def api_current():
             records.append({"name": name, "type": "A", "value": ip, "ttl": rec["ttl"]})
         if rec["CNAME"]:
             records.append({"name": name, "type": "CNAME", "value": rec["CNAME"], "ttl": rec["ttl"]})
+        for ns in rec["NS"]:
+            records.append({"name": name, "type": "NS", "value": ns, "ttl": rec["ttl"]})
     return {"version": snap.version_id, "created_at": snap.created_at, "records": records}
 
 

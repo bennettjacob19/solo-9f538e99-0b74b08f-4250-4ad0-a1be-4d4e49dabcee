@@ -2,8 +2,14 @@
 
 A publish is one transaction: insert version row + all record rows + move
 the current_version pointer. Any failure rolls the whole thing back, so the
-database never holds a half-written version and the previous version stays
-current. A restart simply reloads whatever the pointer names."""
+database never holds a half-written version (or half a delegation) and the
+previous version stays current. A restart simply reloads whatever the
+pointer names.
+
+Schema note: the records.rtype CHECK gained 'NS' when delegations were
+introduced. SQLite cannot alter a CHECK, so init() rebuilds the table in a
+single transaction for databases written by older versions; every stored
+row is copied verbatim, so all previously published versions stay readable."""
 
 import sqlite3
 from datetime import datetime, timezone
@@ -17,7 +23,7 @@ CREATE TABLE IF NOT EXISTS versions (
 CREATE TABLE IF NOT EXISTS records (
     version_id INTEGER NOT NULL REFERENCES versions(id),
     name       TEXT NOT NULL,
-    rtype      TEXT NOT NULL CHECK (rtype IN ('A', 'CNAME')),
+    rtype      TEXT NOT NULL CHECK (rtype IN ('A', 'CNAME', 'NS')),
     value      TEXT NOT NULL,
     ttl        INTEGER NOT NULL,
     UNIQUE (version_id, name, rtype, value)
@@ -28,6 +34,27 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 """
+
+# records table without 'NS' in its rtype CHECK -> written by an old release
+MIGRATE_RECORDS = [
+    """
+    CREATE TABLE records_mig (
+        version_id INTEGER NOT NULL REFERENCES versions(id),
+        name       TEXT NOT NULL,
+        rtype      TEXT NOT NULL CHECK (rtype IN ('A', 'CNAME', 'NS')),
+        value      TEXT NOT NULL,
+        ttl        INTEGER NOT NULL,
+        UNIQUE (version_id, name, rtype, value)
+    )
+    """,
+    """
+    INSERT INTO records_mig (version_id, name, rtype, value, ttl)
+        SELECT version_id, name, rtype, value, ttl FROM records
+    """,
+    "DROP TABLE records",
+    "ALTER TABLE records_mig RENAME TO records",
+    "CREATE INDEX IF NOT EXISTS idx_records_version ON records(version_id)",
+]
 
 
 def utcnow():
@@ -50,8 +77,32 @@ class Store:
         conn = self._connect()
         try:
             conn.executescript(SCHEMA)
+            self._migrate_records_table(conn)
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate_records_table(conn):
+        """Rebuild the records table if its CHECK predates NS support.
+
+        One transaction: either the whole table is rebuilt with every old
+        row copied, or nothing changes at all."""
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'records'"
+        ).fetchone()
+        if row is None or "'NS'" in row["sql"]:
+            return  # fresh DB already has the new schema, or nothing to do
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for stmt in MIGRATE_RECORDS:
+                conn.execute(stmt)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     def publish(self, rows, note=""):
         """Atomically store a full version and make it current.
